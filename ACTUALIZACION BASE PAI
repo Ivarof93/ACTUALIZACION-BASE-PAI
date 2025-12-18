@@ -307,41 +307,62 @@ class AppPAIUpdater:
             cols_to_drop = [col for col in base_actualizada.columns if col.endswith('_bdua') or col.endswith('_pai')]
             base_actualizada.drop(columns=cols_to_drop, inplace=True)
             self.progress.set(0.4)
+            # --- REEMPLAZA LA SECCIÓN DEL PASO 3 CON ESTO ---
             self.status_label.configure(text="Paso 3/5: Actualizando biológicos por Documento y Tipo...")
             total_cols = len(equivalencias_bio)
+
             for i, (pai_col, ftp_cols) in enumerate(equivalencias_bio.items()):
                 if pai_col in pai_original_columns:
                     if pai_col in base_actualizada.columns:
                         base_actualizada[pai_col] = base_actualizada[pai_col].apply(self.universal_date_parser)
 
-                    ftp_cols_to_keep = ['NUM_DOC', 'TIPO'] + [c for c in ftp_cols if c in ftp_df.columns]
-                    ftp_dates_temp = ftp_df[ftp_cols_to_keep].copy().drop_duplicates(subset=['NUM_DOC', 'TIPO'])
-                    valid_ftp_cols = [col for col in ftp_cols if col in ftp_dates_temp.columns]
-                    if valid_ftp_cols:
-                        for col in valid_ftp_cols:
-                            ftp_dates_temp[col] = ftp_dates_temp[col].apply(self.universal_date_parser)
+                    # 1. Filtramos las columnas que necesitamos del FTP
+                    valid_ftp_cols = [c for c in ftp_cols if c in ftp_df.columns]
 
-                        ftp_dates_temp['max_date_ftp'] = ftp_dates_temp[valid_ftp_cols].max(axis=1)
-                        base_actualizada = pd.merge(base_actualizada,
-                                                    ftp_dates_temp[['NUM_DOC', 'TIPO', 'max_date_ftp']],
-                                                    on=['NUM_DOC', 'TIPO'], how='left')
+                    if valid_ftp_cols:
+                        ftp_subset = ftp_df[['NUM_DOC', 'TIPO'] + valid_ftp_cols].copy()
+
+                        # 2. Convertimos todas las columnas de fecha del FTP a formato datetime
+                        for col in valid_ftp_cols:
+                            ftp_subset[col] = ftp_subset[col].apply(self.universal_date_parser)
+
+                        # 3. Calculamos la fecha máxima por FILA en el FTP
+                        ftp_subset['max_date_fila'] = ftp_subset[valid_ftp_cols].max(axis=1)
+
+                        # 4. ¡ESTA ES LA CLAVE!: Agrupamos por paciente y nos quedamos con la fecha máxima de todas sus filas
+                        ftp_max_per_patient = ftp_subset.groupby(['NUM_DOC', 'TIPO'])[
+                            'max_date_fila'].max().reset_index()
+                        ftp_max_per_patient.rename(columns={'max_date_fila': 'max_date_ftp'}, inplace=True)
+
+                        # 5. Cruzamos con la base actualizada
+                        base_actualizada = pd.merge(base_actualizada, ftp_max_per_patient, on=['NUM_DOC', 'TIPO'],
+                                                    how='left')
+
+                        # 6. Lógica de comparación (Reporte)
                         if self.generate_report.get() and pai_col in base_actualizada.columns:
-                            cambios_ftp_df = base_actualizada[(base_actualizada['max_date_ftp'].notna()) & (
-                                        (pd.isna(base_actualizada[pai_col])) | (
-                                            base_actualizada['max_date_ftp'] > base_actualizada[pai_col]))][
-                                ['NUM_DOC', 'TIPO', pai_col, 'max_date_ftp']].copy()
+                            mask_cambio = (base_actualizada['max_date_ftp'].notna()) & (
+                                    (pd.isna(base_actualizada[pai_col])) | (
+                                        base_actualizada['max_date_ftp'] > base_actualizada[pai_col])
+                            )
+                            cambios_ftp_df = base_actualizada[mask_cambio].copy()
+
                             for _, row in cambios_ftp_df.iterrows():
-                                valor_anterior_str = '' if pd.isna(row[pai_col]) else row[pai_col].strftime('%d/%m/%Y')
-                                valor_nuevo_str = row['max_date_ftp'].strftime('%d/%m/%Y')
-                                if valor_anterior_str != valor_nuevo_str: self.cambios_log.append(
-                                    {'NUM_DOC': row['NUM_DOC'], 'CAMPO_MODIFICADO': pai_col,
-                                     'VALOR_ANTERIOR': valor_anterior_str, 'VALOR_NUEVO': valor_nuevo_str,
-                                     'FUENTE': 'FTP'})
+                                val_ant = '' if pd.isna(row[pai_col]) else row[pai_col].strftime('%d/%m/%Y')
+                                val_nue = row['max_date_ftp'].strftime('%d/%m/%Y')
+                                if val_ant != val_nue:
+                                    self.cambios_log.append({
+                                        'NUM_DOC': row['NUM_DOC'], 'CAMPO_MODIFICADO': pai_col,
+                                        'VALOR_ANTERIOR': val_ant, 'VALOR_NUEVO': val_nue, 'FUENTE': 'FTP'
+                                    })
+
+                        # 7. Actualizamos la columna con el valor más reciente
                         if pai_col in base_actualizada.columns:
                             base_actualizada[pai_col] = base_actualizada[[pai_col, 'max_date_ftp']].max(axis=1)
                         else:
                             base_actualizada[pai_col] = base_actualizada['max_date_ftp']
+
                         base_actualizada.drop(columns=['max_date_ftp'], inplace=True)
+
                 self.progress.set(0.4 + (((i + 1) / total_cols) * 0.5))
             self.status_label.configure(text="Paso 4/5: Reconstruyendo estructura final...")
             columnas_finales = [col for col in pai_original_columns if col in base_actualizada.columns]
